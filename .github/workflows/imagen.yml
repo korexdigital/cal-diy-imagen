@@ -1,0 +1,139 @@
+# Imagen de Cal.diy para Korex Digital (https://cal.korex.digital).
+# Va en el repo publico korexdigital/cal-diy-imagen, en .github/workflows/imagen.yml.
+# Frente VPS del montaje, 2026-10-07. Decision de Pablo del 2026-10-07: opcion 1, imagen propia
+# construida en GitHub Actions, porque Cal.diy no publica imagen (docker.io/calcom/cal.diy sin
+# etiquetas). Copia el metodo de la accion oficial .github/actions/docker-build-and-test de
+# calcom/cal.diy. La imagen no lleva ninguna clave: NEXTAUTH_SECRET, CALENDSO_ENCRYPTION_KEY y la
+# base de datos se ponen al arrancar en el servidor. Lleva el alta publica cerrada desde la
+# construccion (NEXT_PUBLIC_DISABLE_SIGNUP=true); las invitaciones con token siguen funcionando.
+# Corre sola al subir un cambio de este fichero a main (con el commit fijado abajo, en COMMIT), o a
+# mano (Actions > Imagen de Cal.diy > Run workflow) con otro commit completo de Cal.diy.
+# Para actualizar Cal.diy: se cambia el commit fijado aqui, se sube, y se fija el digest nuevo en el servidor.
+name: Imagen de Cal.diy
+
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/imagen.yml"]
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "Commit COMPLETO de calcom/cal.diy (40 caracteres; nunca main)"
+        required: true
+        default: "54343aa685ae8f33159d2f485ec4a57bad5c574a"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: imagen-cal-diy
+  cancel-in-progress: false
+
+jobs:
+  imagen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      COMMIT: ${{ inputs.commit || '54343aa685ae8f33159d2f485ec4a57bad5c574a' }}
+      # Base de datos de usar y tirar que la construccion necesita (las del compose oficial).
+      POSTGRES_USER: unicorn_user
+      POSTGRES_PASSWORD: magical_password
+      POSTGRES_DB: calendso
+      DOMINIO: https://cal.korex.digital
+    steps:
+      - name: Comprobar el commit
+        run: |
+          [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "El commit tiene que ser un sha completo de 40 caracteres."; exit 1; }
+          echo "CORTO=${COMMIT:0:12}" >> "$GITHUB_ENV"
+          echo "IMAGEN=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/cal-diy:${COMMIT:0:12}" >> "$GITHUB_ENV"
+
+      - name: Hacer sitio en el disco
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Bajar Cal.diy en ese commit
+        uses: actions/checkout@v4
+        with:
+          repository: calcom/cal.diy
+          ref: ${{ env.COMMIT }}
+          persist-credentials: false
+
+      - name: Cerrar el alta publica desde la construccion
+        run: |
+          sed -i '0,/^WORKDIR \/calcom$/s//WORKDIR \/calcom\nENV NEXT_PUBLIC_DISABLE_SIGNUP=true/' Dockerfile
+          grep -q '^ENV NEXT_PUBLIC_DISABLE_SIGNUP=true$' Dockerfile || { echo "No se ha podido meter NEXT_PUBLIC_DISABLE_SIGNUP en el Dockerfile."; exit 1; }
+
+      - name: Levantar la base de datos de la construccion
+        run: |
+          grep -o '^[^#]*' .env.example > .env
+          docker compose up -d database
+          for i in $(seq 1 30); do
+            docker compose exec -T database pg_isready -U "$POSTGRES_USER" && exit 0
+            sleep 2
+          done
+          echo "La base de datos no arranca."; docker compose logs database; exit 1
+
+      - name: Preparar buildx en la red de la base de datos
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            network=container:database
+
+      - name: Construir la imagen (sin publicar todavia)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./
+          file: ./Dockerfile
+          load: true
+          push: false
+          platforms: linux/amd64
+          tags: ${{ env.IMAGEN }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ env.COMMIT }}
+            org.opencontainers.image.description=Cal.diy para Korex Digital, construido desde calcom/cal.diy
+            org.opencontainers.image.licenses=MIT
+          build-args: |
+            NEXT_PUBLIC_WEBAPP_URL=${{ env.DOMINIO }}
+            NEXT_PUBLIC_LICENSE_CONSENT=agree
+            CALCOM_TELEMETRY_DISABLED=1
+            DATABASE_URL=postgresql://${{ env.POSTGRES_USER }}:${{ env.POSTGRES_PASSWORD }}@database:5432/${{ env.POSTGRES_DB }}
+            DATABASE_DIRECT_URL=postgresql://${{ env.POSTGRES_USER }}:${{ env.POSTGRES_PASSWORD }}@database:5432/${{ env.POSTGRES_DB }}
+
+      - name: Probar que arranca y que el alta esta cerrada
+        run: |
+          URL_BD="postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@database:5432/$POSTGRES_DB"
+          docker run -d --name prueba --network stack -p 3000:3000 \
+            -e DATABASE_URL="$URL_BD" -e DATABASE_DIRECT_URL="$URL_BD" -e DATABASE_HOST=database:5432 \
+            -e NEXTAUTH_SECRET="$(openssl rand -base64 32)" -e CALENDSO_ENCRYPTION_KEY="$(openssl rand -base64 24)" \
+            -e NEXT_PUBLIC_WEBAPP_URL="$DOMINIO" -e NEXTAUTH_URL="$DOMINIO" -e CALCOM_TELEMETRY_DISABLED=1 \
+            "$IMAGEN"
+          ok=0
+          for i in $(seq 1 60); do
+            if curl -fs -o /dev/null -m 5 http://localhost:3000/; then ok=1; break; fi
+            sleep 10
+          done
+          docker logs --tail 30 prueba
+          [ "$ok" -eq 1 ] || { echo "La imagen no contesta en el puerto 3000 tras 10 minutos."; exit 1; }
+          ALTA=$(curl -s -o /dev/null -m 20 -w '%{http_code}' -X POST -H 'content-type: application/json' -d '{}' http://localhost:3000/api/auth/signup)
+          echo "Alta sin invitacion: $ALTA"
+          [ "$ALTA" = 403 ] || { echo "El alta publica no esta cerrada (tiene que dar 403)."; exit 1; }
+          docker rm -f prueba
+
+      - name: Publicar en ghcr.io
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGEN"
+          DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGEN")
+          {
+            echo "### Imagen publicada"
+            echo ""
+            echo "- Etiqueta: \`$IMAGEN\`"
+            echo "- Digest (lo que se fija en el servidor): \`$DIGEST\`"
+            echo "- Commit de calcom/cal.diy: \`$COMMIT\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          docker logout ghcr.io
